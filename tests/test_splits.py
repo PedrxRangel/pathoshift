@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from src.manifest import load_manifest
-from src.splits import make_splits
+from src.splits import early_stopping_split, make_splits
 from src.utils import ROOT, load_config, resolve_path
 
 
@@ -67,10 +67,47 @@ def test_centro_inexistente():
         make_splits(fake_data(), test_centre=99)
 
 
+def check_early_stopping(train, is_stop, min_tumor):
+    """Regras do conjunto de parada do early stopping."""
+    stop, fit = train[is_stop], train[~is_stop]
+    # pacientes inteiros: nenhum paciente fica dividido entre ajuste e parada
+    assert set(stop["patient_id"]).isdisjoint(set(fit["patient_id"]))
+    # os dois lados têm tumor suficiente
+    assert stop["label"].sum() >= min_tumor and fit["label"].sum() >= min_tumor
+
+
+def test_parada_sai_so_do_treino_sintetico():
+    df = fake_data()
+    df["split"], df["fold"] = make_splits(df, 2, n_folds=4, seed=42, min_tumor=50)
+    dev = df[df["split"] == "dev"]
+    for k in range(4):
+        train = dev[dev["fold"] != k]
+        is_stop = early_stopping_split(train, n_splits=5, seed=42, min_tumor=50)
+        check_early_stopping(train, is_stop, 50)
+        # o conjunto de parada é subconjunto do treino: não contém o fold de validação nem o centro de teste
+        assert (train.loc[is_stop, "fold"] != k).all()
+        assert (train.loc[is_stop, "centre_id"] != 2).all()
+
+
+def test_parada_reprodutivel():
+    df = fake_data()
+    a = early_stopping_split(df, seed=42, min_tumor=50)
+    b = early_stopping_split(df, seed=42, min_tumor=50)
+    assert a.equals(b) and 0 < a.mean() < 0.5
+
+
 def test_manifest_real():
     cfg = load_config(ROOT / "configs" / "default.yaml")
     path = resolve_path(cfg["paths"]["manifest"])
     if not path.exists():
         pytest.skip("data/manifest.jsonl não existe; rode `python pathoshift.py prepare`")
     sp = cfg["splits"]
-    check_splits(load_manifest(path), sp["test_centre"], sp["n_folds"], sp["min_tumor_patches_per_fold"])
+    df = load_manifest(path)
+    check_splits(df, sp["test_centre"], sp["n_folds"], sp["min_tumor_patches_per_fold"])
+    # conjunto de parada de cada fold real: só pacientes do treino daquele fold
+    dev = df[df["split"] == "dev"]
+    for k in range(sp["n_folds"]):
+        train = dev[dev["fold"] != k]
+        is_stop = early_stopping_split(train, sp["es_n_splits"], cfg["seed"], sp["es_min_tumor"])
+        check_early_stopping(train, is_stop, sp["es_min_tumor"])
+        assert set(train.loc[is_stop, "patient_id"]).isdisjoint(set(dev.loc[dev["fold"] == k, "patient_id"]))

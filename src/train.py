@@ -1,15 +1,26 @@
-"""Treino e validação cruzada dos dois modelos: regressão logística (features) e SimpleCNN.
+"""Treino, validação cruzada e modelo final dos dois modelos: regressão logística (features) e SimpleCNN.
+
+Protocolo:
+- Validação cruzada por paciente (4 folds) no conjunto dev. O fold de validação só MEDE:
+  nenhuma escolha (época, hiperparâmetro) olha para ele.
+- CNN: dentro do treino de cada fold, ~1/5 dos pacientes (estratificado) formam o conjunto
+  de PARADA, usado só para o early stopping (splits.early_stopping_split).
+- Modelo final: treinado no dev inteiro (a CNN separa de novo pacientes do dev para a parada).
+  O teste externo (centro 2) é feito depois, pelo comando `predict --teste-externo`.
 
 Saídas em outputs/<modelo>/:
-  cv_folds.csv       métricas de cada fold + média e desvio
-  cv_oof.csv         predição de cada patch do dev quando ele estava na validação
-  cv_history.csv     (CNN) loss, F1 e tempo de cada época de cada fold
-  fold<k>.pt         (CNN) melhor checkpoint do fold k
-  final_*            treino no dev inteiro + teste único no centro externo
+  cv_oof.csv        probabilidade de tumor de cada patch do dev quando ele estava na validação
+  cv_folds.csv      métricas por patch de cada fold + média e desvio
+  cv_history.csv    (CNN) loss de treino, F1 macro do conjunto de parada e tempo de cada época
+  cv_info.json      pacientes de parada, melhor época e tempo de cada fold
+  fold<k>.pt        (CNN) melhor checkpoint do fold k
+  final.pt / final.joblib   modelo final (treinado no dev inteiro)
 """
 
+import json
 import time
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -22,6 +33,7 @@ from src.evaluate import compute_metrics, fold_table, mean_std_text, print_metri
 from src.features import feature_columns, load_features
 from src.manifest import load_manifest
 from src.models import SimpleCNN, build_logreg
+from src.splits import early_stopping_split
 
 
 # ---------------------------------------------------------------- CNN
@@ -68,36 +80,33 @@ def predict_proba(model, loader, device):
     return np.concatenate(probs)
 
 
-def fit_cnn(hf_ds, train_df, val_df, cfg, ckpt_path, max_epochs):
-    """Treina a SimpleCNN com CrossEntropy ponderada e Adam; early stopping pela F1 macro da validação. Aula 08 – Classificação: CNN.
+def fit_cnn(hf_ds, fit_df, stop_df, cfg, ckpt_path, max_epochs):
+    """Treina a SimpleCNN (CrossEntropy ponderada + Adam) com early stopping pela F1 macro do conjunto de PARADA. Aula 08 – Classificação: CNN.
 
-    Se val_df for None (treino final), treina exatamente max_epochs épocas.
-    Devolve (modelo com os melhores pesos, histórico por época).
+    fit_df: patches usados para ajustar os pesos; stop_df: pacientes separados só para decidir a parada.
+    Devolve (modelo com os pesos da melhor época, histórico por época).
     """
     device = utils.get_device()
     c = cfg["cnn"]
     model = SimpleCNN(num_classes=2, image_size=c["image_size"]).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights(train_df["label"].to_numpy()).to(device))
+    criterion = nn.CrossEntropyLoss(weight=class_weights(fit_df["label"].to_numpy()).to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=c["lr"])
-    train_loader = make_loader(hf_ds, train_df, cfg, train=True)
-    val_loader = make_loader(hf_ds, val_df, cfg, train=False) if val_df is not None else None
+    fit_loader = make_loader(hf_ds, fit_df, cfg, train=True)
+    stop_loader = make_loader(hf_ds, stop_df, cfg, train=False)
 
     history, best_f1, best_epoch = [], -1.0, 0
     for epoch in range(1, max_epochs + 1):
         start = time.time()
-        loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        row = {"epoch": epoch, "train_loss": loss}
-        if val_loader is not None:
-            m = compute_metrics(val_df["label"], predict_proba(model, val_loader, device))
-            row.update(val_f1_macro=m["f1_macro"], val_auc=m["auc"])
-        row["tempo_s"] = time.time() - start
+        loss = train_one_epoch(model, fit_loader, optimizer, criterion, device)
+        m = compute_metrics(stop_df["label"], predict_proba(model, stop_loader, device))
+        row = {"epoch": epoch, "train_loss": loss, "parada_f1_macro": m["f1_macro"],
+               "parada_auc": m["auc"], "tempo_s": time.time() - start}
         history.append(row)
         print("  " + " | ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()))
 
         # Early stopping: guarda o melhor modelo e para após `patience` épocas sem melhora
-        f1 = row.get("val_f1_macro", epoch)  # sem validação, a última época é a "melhor"
-        if f1 > best_f1:
-            best_f1, best_epoch = f1, epoch
+        if m["f1_macro"] > best_f1:
+            best_f1, best_epoch = m["f1_macro"], epoch
             torch.save(model.state_dict(), ckpt_path)
         elif epoch - best_epoch >= c["patience"]:
             print(f"  early stopping na época {epoch} (melhor: {best_epoch})")
@@ -109,83 +118,114 @@ def fit_cnn(hf_ds, train_df, val_df, cfg, ckpt_path, max_epochs):
     return model, hist
 
 
-# ---------------------------------------------------------------- validação cruzada e teste final
+def load_cnn(cfg, ckpt_path):
+    """Recria a SimpleCNN e carrega os pesos de um checkpoint. Apoio."""
+    model = SimpleCNN(num_classes=2, image_size=cfg["cnn"]["image_size"]).to(utils.get_device())
+    model.load_state_dict(torch.load(ckpt_path, map_location=utils.get_device()))
+    return model
 
-def _load_dev_and_test(cfg, model_name):
-    """Carrega o manifest (CNN) ou manifest + features (regressão logística). Apoio."""
+
+# ---------------------------------------------------------------- treino genérico (os dois modelos)
+
+def load_data(cfg, model_name):
+    """Manifest (CNN) ou manifest + features (regressão logística), e o dataset HF se for a CNN. Apoio."""
     man = load_manifest(utils.resolve_path(cfg["paths"]["manifest"]))
     if model_name == "logreg":
         man = load_features(utils.resolve_path(cfg["paths"]["features"]), man)
-    return man[man["split"] == "dev"], man[man["split"] == "test_ext"]
+    hf_ds = load_hf_dataset(cfg) if model_name == "cnn" else None
+    return man, hf_ds
 
 
-def _fit_predict(cfg, model_name, train_df, eval_df, hf_ds, out_dir, tag, epochs):
-    """Treina em train_df e devolve (probabilidades em eval_df, histórico ou None). Apoio."""
+def train_model(cfg, model_name, train_df, hf_ds, ckpt_path, max_epochs=None):
+    """Treina o modelo em train_df e devolve (modelo, info). Na CNN, separa os pacientes de parada. Apoio."""
     if model_name == "logreg":
         cols = feature_columns(train_df)
-        clf = build_logreg(cfg).fit(train_df[cols], train_df["label"])
-        return clf.predict_proba(eval_df[cols])[:, 1], None
-    val_df = eval_df if tag.startswith("fold") else None  # no treino final não há validação
-    model, hist = fit_cnn(hf_ds, train_df, val_df, cfg, out_dir / f"{tag}.pt", epochs)
-    loader = make_loader(hf_ds, eval_df, cfg, train=False)
-    return predict_proba(model, loader, utils.get_device()), hist
+        return build_logreg(cfg).fit(train_df[cols], train_df["label"]), {}
+
+    sp = cfg["splits"]
+    is_stop = early_stopping_split(train_df, sp["es_n_splits"], cfg["seed"], sp["es_min_tumor"])
+    fit_df, stop_df = train_df[~is_stop], train_df[is_stop]
+    print(f"  ajuste: {len(fit_df)} patches | parada: {len(stop_df)} patches, "
+          f"pacientes {sorted(stop_df['patient_id'].unique().tolist())} "
+          f"(com tumor: {sorted(stop_df.loc[stop_df['label'] == 1, 'patient_id'].unique().tolist())})")
+    model, hist = fit_cnn(hf_ds, fit_df, stop_df, cfg, ckpt_path, max_epochs or cfg["cnn"]["max_epochs"])
+    info = {
+        "pacientes_parada": sorted(stop_df["patient_id"].unique().tolist()),
+        "pacientes_parada_com_tumor": sorted(stop_df.loc[stop_df["label"] == 1, "patient_id"].unique().tolist()),
+        "patches_ajuste": len(fit_df), "patches_parada": len(stop_df),
+        "melhor_epoca": int(hist["best_epoch"].iloc[0]), "epocas_treinadas": len(hist),
+        "history": hist,
+    }
+    return model, info
+
+
+def predict_model(cfg, model_name, model, df, hf_ds):
+    """Probabilidade de tumor de cada patch de df. Aula 08 – Classificação: predição."""
+    if model_name == "logreg":
+        return model.predict_proba(df[feature_columns(df)])[:, 1]
+    return predict_proba(model, make_loader(hf_ds, df, cfg, train=False), utils.get_device())
 
 
 def run_cv(cfg, model_name, epochs=None):
-    """Validação cruzada por paciente no conjunto dev; imprime e salva média ± desvio entre os folds. Apoio: metodologia."""
+    """Validação cruzada por paciente no dev; o fold de validação só é usado para medir. Apoio: metodologia."""
     utils.set_seed(cfg["seed"])
     out_dir = utils.resolve_path(cfg["paths"]["outputs_dir"]) / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    dev, _ = _load_dev_and_test(cfg, model_name)
-    hf_ds = load_hf_dataset(cfg) if model_name == "cnn" else None
-    epochs = epochs or cfg["cnn"]["max_epochs"]
+    man, hf_ds = load_data(cfg, model_name)
+    dev = man[man["split"] == "dev"]
 
-    metrics, oof, histories = [], [], []
+    metrics, oof, histories, infos = [], [], [], {}
     for k in sorted(dev["fold"].unique()):
         tr, va = dev[dev["fold"] != k], dev[dev["fold"] == k]
         print(f"\n--- {model_name} | fold {k}: treino {len(tr)} patches, validação {len(va)} ---")
         start = time.time()
-        prob, hist = _fit_predict(cfg, model_name, tr, va, hf_ds, out_dir, f"fold{k}", epochs)
+        model, info = train_model(cfg, model_name, tr, hf_ds, out_dir / f"fold{k}.pt", epochs)
+        prob = predict_model(cfg, model_name, model, va, hf_ds)  # só agora o fold k é usado
         m = compute_metrics(va["label"], prob)
         print_metrics(m, f"fold {k} ({time.time() - start:.1f} s)")
         metrics.append(m)
-        oof.append(va[["id", "centre_id", "patient_id", "node_id", "label", "fold"]].assign(prob=prob))
-        if hist is not None:
-            histories.append(hist.assign(fold=k))
+        oof.append(va[["id", "fold"]].assign(prob=prob))
+        if "history" in info:
+            histories.append(info.pop("history").assign(fold=k))
+        infos[int(k)] = {**info, "segundos": round(time.time() - start, 1)}
 
     table = fold_table(metrics)
     table.to_csv(out_dir / "cv_folds.csv")
-    oof = pd.concat(oof)
-    oof.to_csv(out_dir / "cv_oof.csv", index=False)
+    pd.concat(oof).to_csv(out_dir / "cv_oof.csv", index=False)
     if histories:
         pd.concat(histories).to_csv(out_dir / "cv_history.csv", index=False)
-    print(f"\n=== {model_name}: média ± desvio em {len(metrics)} folds ===")
+    (out_dir / "cv_info.json").write_text(json.dumps(infos, indent=2), encoding="utf-8")
+    print(f"\n=== {model_name}: média ± desvio em {len(metrics)} folds (por patch) ===")
     print(mean_std_text(table).to_string())
-    return table, oof
+    return table
 
 
-def run_final(cfg, model_name):
-    """Treina no dev inteiro e avalia UMA vez no centro de teste externo. Apoio: metodologia.
-
-    Na CNN não há validação para o early stopping, então usamos o nº de épocas
-    médio que o early stopping escolheu na validação cruzada (cv_history.csv).
-    """
-    utils.set_seed(cfg["seed"])
+def final_path(cfg, model_name):
+    """Arquivo do modelo final: outputs/logreg/final.joblib ou outputs/cnn/final.pt. Apoio."""
     out_dir = utils.resolve_path(cfg["paths"]["outputs_dir"]) / model_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dev, test = _load_dev_and_test(cfg, model_name)
-    hf_ds = load_hf_dataset(cfg) if model_name == "cnn" else None
+    return out_dir / ("final.joblib" if model_name == "logreg" else "final.pt")
 
-    epochs = None
-    if model_name == "cnn":
-        hist = pd.read_csv(out_dir / "cv_history.csv")  # precisa rodar a CV antes
-        epochs = int(round(hist.groupby("fold")["best_epoch"].first().mean()))
-        print(f"Treino final da CNN com {epochs} épocas (média da CV)")
 
-    prob, _ = _fit_predict(cfg, model_name, dev, test, hf_ds, out_dir, "final", epochs)
-    m = compute_metrics(test["label"], prob)
-    print_metrics(m, f"{model_name} | TESTE EXTERNO (centro {cfg['splits']['test_centre']})")
-    test[["id", "centre_id", "patient_id", "node_id", "label"]].assign(prob=prob).to_csv(
-        out_dir / "final_test_preds.csv", index=False)
-    pd.Series({k: v for k, v in m.items() if k != "confusion_matrix"}).to_csv(out_dir / "final_test_metrics.csv")
-    return m
+def run_final(cfg, model_name, epochs=None):
+    """Treina o modelo final no dev inteiro e salva; NÃO olha o teste externo. Apoio: metodologia."""
+    utils.set_seed(cfg["seed"])
+    path = final_path(cfg, model_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    man, hf_ds = load_data(cfg, model_name)
+    dev = man[man["split"] == "dev"]
+    model, info = train_model(cfg, model_name, dev, hf_ds, path, epochs)
+    if model_name == "logreg":
+        joblib.dump(model, path)
+    if "history" in info:
+        info.pop("history").to_csv(path.parent / "final_history.csv", index=False)
+    (path.parent / "final_info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    print(f"Modelo final salvo em {path}")
+    return info
+
+
+def load_final(cfg, model_name):
+    """Carrega o modelo final salvo por run_final. Apoio."""
+    path = final_path(cfg, model_name)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} não existe; rode `python pathoshift.py train --model {model_name} --final`")
+    return joblib.load(path) if model_name == "logreg" else load_cnn(cfg, path)
