@@ -1,0 +1,43 @@
+# Configuração padrão do projeto PathoShift.
+# Caminhos relativos são resolvidos a partir da raiz do repositório.
+
+seed: 42
+
+dataset:
+  hf_name: chehablab/MiniCAMELYON17
+  revision: 748aa39ae6d0e605192f0c72adb690ea7f0a04b9  # commit fixo do dataset no HF (reprodutibilidade)
+  cache_dir: null  # null = cache padrão do Hugging Face (~/.cache/huggingface)
+
+paths:
+  data_dir: data
+  outputs_dir: outputs
+  manifest: data/manifest.jsonl
+  features: data/features.parquet
+
+splits:
+  test_centre: 2   # teste externo: centro inteiro, usado UMA vez, só no final
+  n_folds: 4       # validação cruzada por paciente nos demais centros (conjunto de desenvolvimento)
+  min_tumor_patches_per_fold: 100  # garante que todo fold tenha paciente com tumor de verdade
+
+features:
+  hsv_bins: 8             # bins por canal no histograma HSV (8 x 3 = 24 valores)
+  blur_ksize: 5           # Gaussiano antes do Sobel (reduz ruído)
+  sobel_threshold: 100    # magnitude do gradiente acima disso conta como "borda"
+  hf_radius: 32           # D0 (pixels) da energia de alta frequência, em patches 256x256
+  tissue_threshold: 20    # limiar global no canal S (0-255) para tecido x fundo (ver EDA)
+  tissue_blur_sigma: 4    # sigma do Gaussiano aplicado ao canal S antes do limiar
+  tissue_kernel: 5        # elemento estruturante da abertura/fecho da máscara de tecido
+  nuclei_kernel: 3        # elemento estruturante da abertura da máscara de núcleos
+  nuclei_min_area: 15     # componentes menores que isso (pixels) são ruído
+
+logreg:
+  C: 1.0
+  max_iter: 2000
+
+cnn:
+  image_size: 128   # patches 256x256 reduzidos para 128x128
+  batch_size: 64
+  max_epochs: 20
+  patience: 4       # early stopping: para se a F1 macro da validação não melhora por 4 épocas
+  lr: 0.0001        # com 0.001 a rede colapsou (loss presa em ln2 = 0,69) em 2 de 4 folds
+  num_workers: 4
