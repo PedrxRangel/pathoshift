@@ -29,6 +29,25 @@ def assign_folds(dev, n_folds=4, seed=42, min_tumor=100, max_tries=50):
     raise RuntimeError("Não foi possível ter tumor em todos os folds; reduza n_folds ou min_tumor.")
 
 
+def early_stopping_split(train_df, n_splits=5, seed=42, min_tumor=100, max_tries=50):
+    """Marca ~1/n_splits dos PACIENTES do treino (estratificado pelo rótulo) como conjunto de parada do early stopping. Apoio: metodologia.
+
+    O conjunto de parada sai só do treino do fold; assim o fold de validação nunca
+    influencia o treino e serve apenas para medir. Escolhe o primeiro grupo de pacientes
+    com pelo menos `min_tumor` patches de tumor (e deixa pelo menos isso no treino).
+    Devolve uma Series booleana (True = conjunto de parada) com o índice de train_df.
+    """
+    y = train_df["label"].to_numpy()
+    for attempt in range(max_tries):
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed + attempt)
+        for _, es_idx in sgkf.split(train_df, y, groups=train_df["patient_id"]):
+            is_es = np.zeros(len(train_df), dtype=bool)
+            is_es[es_idx] = True
+            if y[is_es].sum() >= min_tumor and y[~is_es].sum() >= min_tumor:
+                return pd.Series(is_es, index=train_df.index, name="parada")
+    raise RuntimeError("Não foi possível montar um conjunto de parada com tumor; reduza es_min_tumor.")
+
+
 def make_splits(df, test_centre, n_folds=4, seed=42, min_tumor=100):
     """Devolve (split, fold): split é 'dev' ou 'test_ext'; fold é 0..n_folds-1 no dev e -1 no teste externo. Apoio: metodologia."""
     if test_centre not in set(df["centre_id"]):

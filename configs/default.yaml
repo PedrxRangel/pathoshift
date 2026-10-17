@@ -18,6 +18,10 @@ splits:
   test_centre: 2   # teste externo: centro inteiro, usado UMA vez, só no final
   n_folds: 4       # validação cruzada por paciente nos demais centros (conjunto de desenvolvimento)
   min_tumor_patches_per_fold: 100  # garante que todo fold tenha paciente com tumor de verdade
+  # Early stopping da CNN: dentro do TREINO de cada fold, ~1/es_n_splits dos pacientes
+  # (estratificado) formam o conjunto de PARADA. O fold de validação só mede.
+  es_n_splits: 5
+  es_min_tumor: 100  # o conjunto de parada precisa ter um paciente com tumor de verdade
 
 features:
   hsv_bins: 8             # bins por canal no histograma HSV (8 x 3 = 24 valores)
@@ -38,6 +42,6 @@ cnn:
   image_size: 128   # patches 256x256 reduzidos para 128x128
   batch_size: 64
   max_epochs: 20
-  patience: 4       # early stopping: para se a F1 macro da validação não melhora por 4 épocas
-  lr: 0.0001        # com 0.001 a rede colapsou (loss presa em ln2 = 0,69) em 2 de 4 folds
+  patience: 4       # early stopping: para se a F1 macro do conjunto de parada não melhora por 4 épocas
+  lr: 0.0001        # com 0.001 o treino foi instável (loss oscilando e às vezes presa em ln2 = 0,69)
   num_workers: 4

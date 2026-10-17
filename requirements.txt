@@ -11,6 +11,7 @@ numpy==2.5.2
 pandas==3.0.6
 pyarrow==26.0.0
 scikit-learn==1.9.1
+joblib==1.6.0
 opencv-python-headless==5.0.0.93
 matplotlib==3.11.2
 pyyaml==6.0.3
